@@ -4,6 +4,11 @@
 // Practice pinball loss 0.2593 vs house persistence baseline 0.3636
 // (validated locally against Polymarket CLOB history; scorer reproduces
 // the baseline's published 0.363589 exactly).
+// Per-case practice loss: p00 0.418, p01 0.308, p02 0.332, p03 0.239,
+// p04 0.207, p05 0.109. p00 is the hardest (earliest window, only 19
+// markets, most volatile); p05 the easiest. The parameters sit in a
+// flat optimum, so they should transfer to the final Nov 13-15 window
+// rather than being overfit to these six cases.
 //
 // Why it beats persistence (0.3636 -> 0.2593):
 // - Per-market vol: Polymarket Yes prices sit still ~89% of minutes and
