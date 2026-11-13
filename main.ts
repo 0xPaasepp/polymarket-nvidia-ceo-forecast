@@ -1,24 +1,32 @@
 // polymarket-nvidia-ceo-forecast-01 entry (Node 22, stdlib only).
-// Model: per-market EWMA volatility (short halflife 12 min + 30% of long
-// halflife-1440 vol as a jump-risk floor), normal quantiles, no drift.
-// Practice pinball loss 0.2761 vs house persistence baseline 0.3636
+// Model: per-market EWMA volatility + Student-t(3) quantiles + mean
+// reversion to the sum-normalized price + sub-sqrt horizon scaling.
+// Practice pinball loss 0.2593 vs house persistence baseline 0.3636
 // (validated locally against Polymarket CLOB history; scorer reproduces
 // the baseline's published 0.363589 exactly).
 //
-// Tuned parameters (grid search over 6 practice cases, flat optimum so
-// the choice is robust, not knife-edge): SIGMA_MIN 0.0002, SIGMA_MAX
-// 0.004, HL_SHORT 12, HL_LONG 1440, LONG_K 0.3. Both EWMA windows use
-// the last 360 returns: the long window's halflife is what makes it a
-// jump-risk floor, not a longer lookback — a 4320-minute lookback was
-// tested and scores worse (0.403) because it drags in stale jumps from
-// when the markets were new and volatile.
+// Why it beats persistence (0.3636 -> 0.2593):
+// - Per-market vol: Polymarket Yes prices sit still ~89% of minutes and
+//   move in 0.0005 ticks; the baseline's fixed sigma 0.0025 spreads
+//   every market far too wide. Recent per-market vol is mostly
+//   0.0003-0.006, so tighter intervals win.
+// - Student-t(3) quantiles (in SD units): the return distribution is
+//   peaked with fat tails, so t3's tighter inner quantiles
+//   (+/-0.472 vs normal +/-0.674) score better than normal.
+// - Mean reversion to x/sum: Yes prices sum to ~1.0-1.09, and the
+//   overround decays, so each price reverts toward its sum-normalized
+//   value at rate 0.008/min. Big markets drift down most.
+// - Horizon scaling h^0.45 (not sqrt): realized vol grows slower than
+//   a random walk, so long-horizon intervals are narrower.
 //
-// Why it beats persistence: Polymarket Yes prices move in tiny ticks and
-// sit still ~89% of minutes; the baseline's fixed sigma 0.0025 spreads
-// every market far too wide. Recent per-market vol is mostly 0.0002-0.002,
-// so tighter intervals win. Mean reversion and drift both hurt on
-// practice (tested); the cross-market sum constraint is already
-// preserved by the medians, so no normalization is applied.
+// Tuned parameters (grid search over 6 practice cases, flat optimum so
+// the choice is robust, not knife-edge): SIGMA_MIN 0.0003, SIGMA_MAX
+// 0.006, HL_SHORT 8, HL_LONG 1440, LONG_K 0.3, MR_K 0.008, GAMMA 0.45.
+// Both EWMA windows use the last 360 returns: the long window's
+// halflife is what makes it a jump-risk floor, not a longer lookback.
+// Tested and rejected: logit-space model, empirical h-step quantiles,
+// drift from recent returns, time-of-day vol, asymmetric up/down sigma,
+// k-min return vol, p_move scaling, cross-market median renormalization.
 //
 // Runs offline, no network, under the 8,000 ms per-case cap.
 //   mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
@@ -30,14 +38,16 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
-const Z = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
-const SIGMA_MIN = 0.0002;
-const SIGMA_MAX = 0.004;
-const HL_SHORT = 12; // minutes, EWMA halflife for recent vol
+// Student-t(3) quantiles in SD units: t_q / sqrt(3/(3-2)).
+const Z = [-1.358732, -0.471673, 0, 0.471673, 1.358732];
+const SIGMA_MIN = 0.0003;
+const SIGMA_MAX = 0.006;
+const HL_SHORT = 8; // minutes, EWMA halflife for recent vol
 const HL_LONG = 1440; // minutes, EWMA halflife for jump-risk floor
 const LONG_K = 0.3; // floor = LONG_K * long-term vol
-const LOOKBACK_SHORT = 360; // minutes of returns for short vol
-const LOOKBACK_LONG = 360; // minutes of returns for long vol (matches tuned prototype)
+const LOOKBACK = 360; // minutes of returns for both EWMA windows
+const MR_K = 0.008; // mean-reversion rate toward x/sum, per minute
+const GAMMA = 0.45; // horizon scaling exponent: width ~ h^GAMMA
 
 interface CaseMarket {
   id: string;
@@ -72,27 +82,32 @@ function ewmaVol(prices: number[], halflife: number, lookback: number): number {
 }
 
 /** Per-market 1-min return volatility used for every horizon.
- * Short EWMA (halflife 12 min) tracks current jitter; the long EWMA
+ * Short EWMA (halflife 8 min) tracks current jitter; the long EWMA
  * (halflife 1440 min) floored at 30% guards a market that has been flat
- * recently but has a history of jumps — a flat market can still jump on
- * news. SIGMA_MIN 0.0002 is about one 0.0005 tick every ~6 minutes, so
- * even a perfectly flat market gets a nonzero spread; SIGMA_MAX 0.004
- * caps the width for the wildest markets. */
+ * recently but has a history of jumps. SIGMA_MIN 0.0003 is about one
+ * 0.0005 tick every ~3 minutes, so even a perfectly flat market gets a
+ * nonzero spread; SIGMA_MAX 0.006 caps the width for the wildest markets. */
 function marketSigma(prices: number[]): number {
-  const sigShort = ewmaVol(prices, HL_SHORT, LOOKBACK_SHORT);
-  const sigLong = ewmaVol(prices, HL_LONG, LOOKBACK_LONG);
+  const sigShort = ewmaVol(prices, HL_SHORT, LOOKBACK);
+  const sigLong = ewmaVol(prices, HL_LONG, LOOKBACK);
   return Math.min(SIGMA_MAX, Math.max(SIGMA_MIN, sigShort, LONG_K * sigLong));
 }
 
-function forecast(m: CaseMarket, horizon: number): number[][] {
+function forecast(m: CaseMarket, horizon: number, sum: number): number[][] {
   const p = m.prices;
   if (p.length === 0) throw new Error(`market ${m.id} has no prices`);
   const x = p[p.length - 1]!;
   const sigma = marketSigma(p);
+  const target = sum > 0 ? x / sum : x;
   const rows: number[][] = [];
   for (let h = 1; h <= horizon; h++) {
-    const s = sigma * Math.sqrt(h);
-    rows.push(Z.map((z) => price6(x + z * s)));
+    const center = x + (target - x) * (1 - Math.exp(-MR_K * h));
+    const s = sigma * Math.pow(h, GAMMA);
+    const row = Z.map((z) => price6(center + z * s));
+    for (let j = 1; j < row.length; j++) {
+      if (row[j]! < row[j - 1]!) row[j] = row[j - 1]!;
+    }
+    rows.push(row);
   }
   return rows;
 }
@@ -105,6 +120,7 @@ for (const file of inputs) {
   if (c.quantiles.length !== QUANTILES.length || c.quantiles.some((t, j) => t !== QUANTILES[j])) {
     throw new Error(`${file} asks for quantiles ${JSON.stringify(c.quantiles)}, not ${JSON.stringify(QUANTILES)}`);
   }
-  const forecasts = c.markets.map((m) => ({ id: m.id, q: forecast(m, c.horizon_minutes) }));
+  const sum = c.markets.reduce((acc, m) => acc + (m.prices.length > 0 ? m.prices[m.prices.length - 1]! : 0), 0);
+  const forecasts = c.markets.map((m) => ({ id: m.id, q: forecast(m, c.horizon_minutes, sum) }));
   writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts })}\n`);
 }
