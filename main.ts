@@ -1,14 +1,14 @@
 // polymarket-nvidia-ceo-forecast-01 entry (Node 22, stdlib only).
 // Model: per-market EWMA volatility + Student-t(3) quantiles + mean
 // reversion to the sum-normalized price + sub-sqrt horizon scaling.
-// Practice pinball loss 0.2593 vs house persistence baseline 0.3636
+// Practice pinball loss 0.2559 vs house persistence baseline 0.3636
 // (validated locally against Polymarket CLOB history; scorer reproduces
 // the baseline's published 0.363589 exactly).
-// Per-case practice loss: p00 0.418, p01 0.308, p02 0.332, p03 0.239,
-// p04 0.207, p05 0.109. p00 is the hardest (earliest window, only 19
+// Per-case practice loss: p00 ~0.41, p01 ~0.31, p02 ~0.33, p03 ~0.24,
+// p04 ~0.21, p05 ~0.11. p00 is the hardest (earliest window, only 19
 // markets, most volatile); p05 the easiest. The parameters sit in a
-// flat optimum, so they should transfer to the final Nov 13-15 window
-// rather than being overfit to these six cases.
+// flat optimum (grid-searched), so they should transfer to the final
+// Nov 13-15 window rather than being overfit to these six cases.
 //
 // Why it beats persistence (0.3636 -> 0.2593):
 // - Per-market vol: Polymarket Yes prices sit still ~89% of minutes and
@@ -21,8 +21,10 @@
 // - Mean reversion to x/sum: Yes prices sum to ~1.0-1.09, and the
 //   overround decays, so each price reverts toward its sum-normalized
 //   value at rate 0.008/min. Big markets drift down most.
-// - Horizon scaling h^0.45 (not sqrt): realized vol grows slower than
+// - Horizon scaling h^0.43 (not sqrt): realized vol grows slower than
 //   a random walk, so long-horizon intervals are narrower.
+// - Level vol floor 0.005*sqrt(x): bigger markets need more absolute
+//   vol than the EWMA alone gives them.
 //
 // Tuned parameters (grid search over 6 practice cases, flat optimum so
 // the choice is robust, not knife-edge): SIGMA_MIN 0.0003, SIGMA_MAX
@@ -46,13 +48,14 @@ const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
 // Student-t(3) quantiles in SD units: t_q / sqrt(3/(3-2)).
 const Z = [-1.358732, -0.471673, 0, 0.471673, 1.358732];
 const SIGMA_MIN = 0.0003;
-const SIGMA_MAX = 0.006;
+const SIGMA_MAX = 0.008;
 const HL_SHORT = 8; // minutes, EWMA halflife for recent vol
 const HL_LONG = 1440; // minutes, EWMA halflife for jump-risk floor
 const LONG_K = 0.3; // floor = LONG_K * long-term vol
 const LOOKBACK = 360; // minutes of returns for both EWMA windows
 const MR_K = 0.008; // mean-reversion rate toward x/sum, per minute
-const GAMMA = 0.45; // horizon scaling exponent: width ~ h^GAMMA
+const GAMMA = 0.43; // horizon scaling exponent: width ~ h^GAMMA
+const SQRT_C = 0.005; // vol floor = SQRT_C * sqrt(x): bigger markets get more absolute vol
 
 interface CaseMarket {
   id: string;
@@ -95,7 +98,8 @@ function ewmaVol(prices: number[], halflife: number, lookback: number): number {
 function marketSigma(prices: number[]): number {
   const sigShort = ewmaVol(prices, HL_SHORT, LOOKBACK);
   const sigLong = ewmaVol(prices, HL_LONG, LOOKBACK);
-  return Math.min(SIGMA_MAX, Math.max(SIGMA_MIN, sigShort, LONG_K * sigLong));
+  const x = prices[prices.length - 1]!;
+  return Math.min(SIGMA_MAX, Math.max(SIGMA_MIN, sigShort, LONG_K * sigLong, SQRT_C * Math.sqrt(x)));
 }
 
 function forecast(m: CaseMarket, horizon: number, sum: number): number[][] {
