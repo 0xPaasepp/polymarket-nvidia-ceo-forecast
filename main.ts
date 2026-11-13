@@ -28,12 +28,14 @@
 //
 // Tuned parameters (grid search over 6 practice cases, flat optimum so
 // the choice is robust, not knife-edge): SIGMA_MIN 0.0003, SIGMA_MAX
-// 0.006, HL_SHORT 8, HL_LONG 1440, LONG_K 0.3, MR_K 0.008, GAMMA 0.45.
-// Both EWMA windows use the last 360 returns: the long window's
-// halflife is what makes it a jump-risk floor, not a longer lookback.
-// Tested and rejected: logit-space model, empirical h-step quantiles,
-// drift from recent returns, time-of-day vol, asymmetric up/down sigma,
-// k-min return vol, p_move scaling, cross-market median renormalization.
+// 0.008, HL_SHORT 8, HL_LONG 1440, LONG_K 0.3, MR_K 0.008, GAMMA 0.43,
+// SQRT_C 0.005. Both EWMA windows use the last 360 returns: the long
+// window's halflife is what makes it a jump-risk floor, not a longer
+// lookback. A full grid re-search around these values confirmed 0.2559
+// as the best in this model family; the remaining gap to the practice
+// top (~0.241) did not close with any of ~25 tested variants (logit,
+// empirical quantiles, asymmetric sigma, OU, k-min vol, range vol,
+// global activity, long-run vol floor, mr_k level scaling).
 //
 // Runs offline, no network, under the 8,000 ms per-case cap.
 //   mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
