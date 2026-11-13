@@ -71,13 +71,24 @@ function ewmaVol(prices: number[], halflife: number, lookback: number): number {
   return wsum > 0 ? Math.sqrt(variance / wsum) : 0;
 }
 
+/** Per-market 1-min return volatility used for every horizon.
+ * Short EWMA (halflife 12 min) tracks current jitter; the long EWMA
+ * (halflife 1440 min) floored at 30% guards a market that has been flat
+ * recently but has a history of jumps — a flat market can still jump on
+ * news. SIGMA_MIN 0.0002 is about one 0.0005 tick every ~6 minutes, so
+ * even a perfectly flat market gets a nonzero spread; SIGMA_MAX 0.004
+ * caps the width for the wildest markets. */
+function marketSigma(prices: number[]): number {
+  const sigShort = ewmaVol(prices, HL_SHORT, LOOKBACK_SHORT);
+  const sigLong = ewmaVol(prices, HL_LONG, LOOKBACK_LONG);
+  return Math.min(SIGMA_MAX, Math.max(SIGMA_MIN, sigShort, LONG_K * sigLong));
+}
+
 function forecast(m: CaseMarket, horizon: number): number[][] {
   const p = m.prices;
   if (p.length === 0) throw new Error(`market ${m.id} has no prices`);
   const x = p[p.length - 1]!;
-  const sigShort = ewmaVol(p, HL_SHORT, LOOKBACK_SHORT);
-  const sigLong = ewmaVol(p, HL_LONG, LOOKBACK_LONG);
-  const sigma = Math.min(SIGMA_MAX, Math.max(SIGMA_MIN, sigShort, LONG_K * sigLong));
+  const sigma = marketSigma(p);
   const rows: number[][] = [];
   for (let h = 1; h <= horizon; h++) {
     const s = sigma * Math.sqrt(h);
